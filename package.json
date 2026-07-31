@@ -1,0 +1,26 @@
+{
+  "name": "lowkey-panel",
+  "version": "1.0.0",
+  "description": "⚡ Lowkey Panel — VLESS Proxy Management on Cloudflare Workers",
+  "main": "worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create lowkey-db",
+    "db:init": "wrangler d1 execute lowkey-db --file=schema.sql"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "vless",
+    "proxy",
+    "panel",
+    "lowkey",
+    "serverless"
+  ],
+  "author": "Shayan (Lowkey)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/siptamr-commits/lowkey-panel"
+  }
+}
