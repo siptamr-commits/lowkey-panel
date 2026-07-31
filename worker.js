@@ -299,8 +299,8 @@ const TelegramBot = {
 	},
 	mainMenuKeyboard(env, userId) {
 		const rows = [
-			[{ text: "\u2795 \u0633\u0627\u062e\u062a \u06a9\u0627\u0646\u0641\u06cc\u06af \u062c\u062f\u06cc\u062f", callback_data: "new_config" }],
-			[{ text: "\ud83d\udcc4 \u06a9\u0627\u0646\u0641\u06cc\u06af\u200c\u0647\u0627\u06cc \u0645\u0646", callback_data: "my_configs" }],
+			[{ text: "\ud83d\uded2 \u062e\u0631\u06cc\u062f \u06a9\u0627\u0646\u0641\u06cc\u06af \u062c\u062f\u06cc\u062f", callback_data: "buy_menu" }],
+			[{ text: "\ud83d\udcb0 \u06a9\u06cc\u0641 \u067e\u0648\u0644 \u0645\u0646", callback_data: "wallet_menu" }, { text: "\ud83d\udcc4 \u06a9\u0627\u0646\u0641\u06cc\u06af\u200c\u0647\u0627\u06cc \u0645\u0646", callback_data: "my_configs" }],
 			[{ text: "\u2139\ufe0f \u062f\u0631\u0628\u0627\u0631\u0647\u0654 \u0644\u0648\u06a9\u06cc", callback_data: "about" }],
 		];
 		if (this.isAdmin(env, userId)) {
@@ -308,8 +308,239 @@ const TelegramBot = {
 		}
 		return { inline_keyboard: rows };
 	},
+	fmtToman(n) {
+		return Number(n || 0).toLocaleString("en-US") + " \u062a\u0648\u0645\u0627\u0646";
+	},
+	async getWallet(env, tgUserId, tgChatId) {
+		try {
+			let row = await env.DB.prepare("SELECT * FROM wallets WHERE tg_user_id = ?").bind(String(tgUserId)).first();
+			if (!row) {
+				await env.DB.prepare("INSERT INTO wallets (tg_user_id, tg_chat_id, balance, updated_at) VALUES (?, ?, 0, ?)").bind(String(tgUserId), String(tgChatId || tgUserId), Date.now()).run();
+				row = { tg_user_id: String(tgUserId), tg_chat_id: String(tgChatId || tgUserId), balance: 0 };
+			}
+			return row;
+		} catch (e) {
+			return { tg_user_id: String(tgUserId), balance: 0 };
+		}
+	},
+	async adjustWallet(env, tgUserId, tgChatId, amount, type, note) {
+		await this.getWallet(env, tgUserId, tgChatId);
+		await env.DB.prepare("UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE tg_user_id = ?").bind(amount, Date.now(), String(tgUserId)).run();
+		await env.DB.prepare("INSERT INTO wallet_tx (tg_user_id, amount, type, note, created_at) VALUES (?, ?, ?, ?, ?)").bind(String(tgUserId), amount, type, note || "", Date.now()).run();
+		const row = await env.DB.prepare("SELECT balance FROM wallets WHERE tg_user_id = ?").bind(String(tgUserId)).first();
+		return row ? row.balance : 0;
+	},
+	async getCardInfo(env) {
+		const num = await env.DB.prepare("SELECT value FROM settings WHERE key = 'card_number'").first();
+		const holder = await env.DB.prepare("SELECT value FROM settings WHERE key = 'card_holder'").first();
+		return { number: num ? num.value : null, holder: holder ? holder.value : null };
+	},
+	async setSetting(env, key, value) {
+		await env.DB.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").bind(key, value).run();
+	},
+	// ===== Buy flow =====
+	flagEmoji(code) {
+		if (!code || code === "NONE") return "\ud83c\udf10";
+		try {
+			const codePoints = code.toUpperCase().split("").map((ch) => 127397 + ch.charCodeAt(0));
+			return String.fromCodePoint(...codePoints);
+		} catch (e) {
+			return "\ud83c\udf10";
+		}
+	},
+	async getVipCountries(env) {
+		if (typeof cachedVipCountries !== "undefined" && cachedVipCountries.length > 0 && Date.now() - lastVipCountriesFetch < 3600000) {
+			return cachedVipCountries;
+		}
+		try {
+			const ghRes = await fetch("https://api.github.com/repos/zeus-panel/ZEUS-PANEL/contents/proxy/proxy_vip", {
+				headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
+			});
+			if (ghRes.ok) {
+				const files = await ghRes.json();
+				const list = files.filter((f) => f.name.endsWith(".txt")).map((f) => f.name.replace(".txt", "").toUpperCase());
+				if (list.length > 0) {
+					if (typeof cachedVipCountries !== "undefined") {
+						cachedVipCountries = list;
+						lastVipCountriesFetch = Date.now();
+					}
+					return list;
+				}
+			}
+		} catch (e) {}
+		return ["DE", "US", "GB", "NL", "FR", "TR"];
+	},
+	async sendCountrySelect(env, chatId, planId) {
+		const countries = await this.getVipCountries(env);
+		const rows = [];
+		for (let i = 0; i < countries.length; i += 2) {
+			const row = [{ text: this.flagEmoji(countries[i]) + " " + countries[i], callback_data: "buy_country:" + countries[i] }];
+			if (countries[i + 1]) row.push({ text: this.flagEmoji(countries[i + 1]) + " " + countries[i + 1], callback_data: "buy_country:" + countries[i + 1] });
+			rows.push(row);
+		}
+		rows.push([{ text: "\ud83c\udf10 \u0628\u062f\u0648\u0646 IP \u0627\u062e\u062a\u0635\u0627\u0635\u06cc (\u067e\u06cc\u0634\u200c\u0641\u0631\u0636)", callback_data: "buy_country:NONE" }]);
+		rows.push([{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "buy_menu" }]);
+		await this.setSession(env, chatId, "await_buy_country", { planId });
+		await this.call(env, "sendMessage", {
+			chat_id: chatId,
+			text: "\ud83c\udf0d \u06a9\u0627\u0646\u0641\u06cc\u06af\u062a \u0627\u0632 \u06a9\u062f\u0627\u0645 \u06a9\u0634\u0648\u0631 \u0631\u062f \u0628\u0632\u0646\u0647 \u0631\u062f \ud83d\udd3b\n\n\u0627\u06af\u0631 \u06a9\u0634\u0648\u0631 \u062e\u0627\u0635\u06cc \u0645\u062f\u0646\u0638\u0631\u062a \u0646\u06cc\u0633\u062a\u060c \u06af\u0632\u06cc\u0646\u0647\u0654 \u00ab\u0628\u062f\u0648\u0646 IP \u0627\u062e\u062a\u0635\u0627\u0635\u06cc\u00bb \u0631\u0648 \u0628\u0632\u0646.",
+			reply_markup: { inline_keyboard: rows },
+		});
+	},
+	async sendPlansList(env, chatId) {
+		const { results } = await env.DB.prepare("SELECT * FROM plans WHERE is_active = 1 ORDER BY sort_order ASC, price ASC").all();
+		if (!results || results.length === 0) {
+			await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0641\u0639\u0644\u0627\u064b \u067e\u0644\u0646\u06cc \u0628\u0631\u0627\u06cc \u0641\u0631\u0648\u0634 \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a. \u0628\u0639\u062f\u0627\u064b \u0645\u0631\u0627\u062c\u0639\u0647 \u06a9\u0646.", reply_markup: { inline_keyboard: [[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "back_menu" }]] } });
+			return;
+		}
+		const rows = results.map((p) => [{ text: p.name + " \u2014 " + p.gb + " \u06af\u06cc\u06af / " + p.days + " \u0631\u0648\u0632 \u2014 " + this.fmtToman(p.price), callback_data: "buy_plan:" + p.id }]);
+		rows.push([{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "back_menu" }]);
+		await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\uded2 *\u067e\u0644\u0646\u200c\u0647\u0627\u06cc \u0641\u0631\u0648\u0634:*\n\n\u06cc\u06a9\u06cc \u0627\u0632 \u067e\u0644\u0646\u200c\u0647\u0627 \u0631\u0648 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646:", parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } });
+	},
+	async buyPlan(env, request, chatId, userId, planId, countryCode) {
+		const plan = await env.DB.prepare("SELECT * FROM plans WHERE id = ? AND is_active = 1").bind(planId).first();
+		if (!plan) {
+			await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0627\u06cc\u0646 \u067e\u0644\u0646 \u062f\u06cc\u06af\u0631 \u0641\u0639\u0627\u0644 \u0646\u06cc\u0633\u062a." });
+			return;
+		}
+		const wallet = await this.getWallet(env, userId, chatId);
+		if (Number(wallet.balance) < Number(plan.price)) {
+			const deficit = Number(plan.price) - Number(wallet.balance);
+			await this.call(env, "sendMessage", {
+				chat_id: chatId,
+				text: "\u274c \u0645\u0648\u062c\u0648\u062f\u06cc \u06a9\u06cc\u0641 \u067e\u0648\u0644\u062a \u06a9\u0627\u0641\u06cc \u0646\u06cc\u0633\u062a.\n\n\ud83d\udcb0 \u0645\u0648\u062c\u0648\u062f\u06cc \u0641\u0639\u0644\u06cc: " + this.fmtToman(wallet.balance) + "\n\ud83d\udcb8 \u0642\u06cc\u0645\u062a \u067e\u0644\u0646: " + this.fmtToman(plan.price) + "\n\u26a0\ufe0f \u06a9\u0645\u0628\u0648\u062f: " + this.fmtToman(deficit),
+				reply_markup: { inline_keyboard: [[{ text: "\ud83d\udcb3 \u0634\u0627\u0631\u0698 \u06a9\u06cc\u0641 \u067e\u0648\u0644", callback_data: "wallet_topup" }], [{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "buy_menu" }]] },
+			});
+			return;
+		}
+		await this.adjustWallet(env, userId, chatId, -Number(plan.price), "purchase", "\u062e\u0631\u06cc\u062f \u067e\u0644\u0646 " + plan.name);
+
+		// اول از موجودی پیش‌ساخته (stock) این پلن بردار؛ اگر نبود، یک کانفیگ جدید دینامیک بساز
+		const stockItem = await env.DB.prepare("SELECT * FROM users WHERE plan_id = ? AND is_stock = 1 AND sold_at IS NULL ORDER BY created_at ASC LIMIT 1").bind(planId).first();
+		let result;
+		if (stockItem) {
+			const url = new URL(request.url);
+			const host = url.hostname;
+			await env.DB.prepare("UPDATE users SET tg_chat_id = ?, tg_user_id = ?, created_at = ?, sold_at = ?, is_active = 1, user_proxy_iata = COALESCE(?, user_proxy_iata) WHERE username = ?")
+				.bind(String(chatId), String(userId), Date.now(), Date.now(), countryCode || null, stockItem.username)
+				.run();
+			result = { success: true, username: stockItem.username, subUrl: "https://" + host + "/sub/" + encodeURIComponent(stockItem.username) };
+		} else {
+			result = await this.createBotUser(env, request, chatId, userId, { limitGb: plan.gb, expiryDays: plan.days, port: plan.ports, ipLimit: plan.ip_limit, planId: plan.id, proxyIata: countryCode });
+		}
+
+		if (result.success) {
+			try {
+				await env.DB.prepare("INSERT INTO sales_log (tg_user_id, plan_id, plan_name, price, username, created_at) VALUES (?, ?, ?, ?, ?, ?)").bind(String(userId), plan.id, plan.name, plan.price, result.username, Date.now()).run();
+			} catch (e) {}
+			const countryLine = countryCode ? "\n\ud83c\udf0d \u06a9\u0634\u0648\u0631 IP: " + this.flagEmoji(countryCode) + " " + countryCode : "";
+			await this.call(env, "sendMessage", {
+				chat_id: chatId,
+				text: "\u2705 \u062e\u0631\u06cc\u062f \u0645\u0648\u0641\u0642! \u06a9\u0627\u0646\u0641\u06cc\u06af\u062a \u0633\u0627\u062e\u062a\u0647 \u0634\u062f.\n\n\ud83d\udc64 \u0646\u0627\u0645: `" + result.username + "`\n\ud83d\udce6 \u062d\u062c\u0645: " + plan.gb + " GB\n\ud83d\udcc5 \u0627\u0639\u062a\u0628\u0627\u0631: " + plan.days + " \u0631\u0648\u0632" + countryLine + "\n\n\ud83d\udd17 \u0644\u06cc\u0646\u06a9 \u0627\u0634\u062a\u0631\u0627\u06a9:\n`" + result.subUrl + "`",
+				parse_mode: "Markdown",
+			});
+		} else {
+			await this.adjustWallet(env, userId, chatId, Number(plan.price), "refund", "\u0628\u0631\u06af\u0634\u062a \u0648\u062c\u0647 \u062e\u0637\u0627\u06cc \u0633\u0627\u062e\u062a");
+			await this.call(env, "sendMessage", { chat_id: chatId, text: "\u274c \u062e\u0637\u0627 \u062f\u0631 \u0633\u0627\u062e\u062a \u06a9\u0627\u0646\u0641\u06cc\u06af. \u0645\u0628\u0644\u063a \u0628\u0647 \u06a9\u06cc\u0641 \u067e\u0648\u0644\u062a \u0628\u0631\u06af\u0634\u062a." });
+		}
+	},
+	// ===== Wallet menu =====
+	async sendWalletMenu(env, chatId, userId) {
+		const wallet = await this.getWallet(env, userId, chatId);
+		const { results } = await env.DB.prepare("SELECT * FROM wallet_tx WHERE tg_user_id = ? ORDER BY id DESC LIMIT 5").bind(String(userId)).all();
+		let text = "\ud83d\udcb0 *\u06a9\u06cc\u0641 \u067e\u0648\u0644 \u0634\u0645\u0627*\n\n\u0645\u0648\u062c\u0648\u062f\u06cc: " + this.fmtToman(wallet.balance) + "\n";
+		if (results && results.length) {
+			text += "\n\u0622\u062e\u0631\u06cc\u0646 \u062a\u0631\u0627\u06a9\u0646\u0634\u200c\u0647\u0627:\n";
+			for (const t of results) {
+				const sign = t.amount >= 0 ? "+" : "";
+				text += "\u2022 " + sign + Number(t.amount).toLocaleString("en-US") + " \u062a\u0648\u0645\u0627\u0646 \u2014 " + (t.note || t.type) + "\n";
+			}
+		}
+		await this.call(env, "sendMessage", {
+			chat_id: chatId,
+			text,
+			parse_mode: "Markdown",
+			reply_markup: { inline_keyboard: [[{ text: "\ud83d\udcb3 \u0634\u0627\u0631\u0698 \u06a9\u06cc\u0641 \u067e\u0648\u0644", callback_data: "wallet_topup" }], [{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "back_menu" }]] },
+		});
+	},
+	async startWalletTopup(env, chatId) {
+		await this.setSession(env, chatId, "await_topup_amount", {});
+		await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udcb3 \u0645\u0628\u0644\u063a \u0645\u0648\u0631\u062f \u0646\u0638\u0631 \u0631\u0648 \u0628\u0647 \u062a\u0648\u0645\u0627\u0646 \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0641\u0642\u0637 \u0639\u062f\u062f\u060c \u0645\u062b\u0644\u0627 200000):" });
+	},
+	// ===== Admin: plans =====
+	async sendPlansAdminList(env, chatId) {
+		const { results } = await env.DB.prepare("SELECT * FROM plans ORDER BY sort_order ASC, price ASC").all();
+		const rows = (results || []).map((p) => {
+			const dot = p.is_active ? "\ud83d\udfe2" : "\u26aa";
+			return [{ text: dot + " " + p.name + " (" + p.gb + "GB/" + p.days + "d/" + this.fmtToman(p.price) + ")", callback_data: "admin_plan:" + p.id }];
+		});
+		rows.push([{ text: "\u2795 \u0627\u0641\u0632\u0648\u062f\u0646 \u067e\u0644\u0646 \u062c\u062f\u06cc\u062f", callback_data: "admin_plan_add" }]);
+		rows.push([{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_menu" }]);
+		await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udcb3 *\u0645\u062f\u06cc\u0631\u06cc\u062a \u067e\u0644\u0646\u200c\u0647\u0627*", parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } });
+	},
+	async sendPlanDetail(env, chatId, planId) {
+		const p = await env.DB.prepare("SELECT * FROM plans WHERE id = ?").bind(planId).first();
+		if (!p) {
+			await this.call(env, "sendMessage", { chat_id: chatId, text: "\u067e\u0644\u0646 \u067e\u06cc\u062f\u0627 \u0646\u0634\u062f." });
+			return;
+		}
+		const stockRow = await env.DB.prepare("SELECT COUNT(*) as c FROM users WHERE plan_id = ? AND is_stock = 1 AND sold_at IS NULL").bind(planId).first();
+		const soldRow = await env.DB.prepare("SELECT COUNT(*) as c FROM users WHERE plan_id = ? AND sold_at IS NOT NULL").bind(planId).first();
+		const text =
+			"\ud83d\udcb3 *" + p.name + "*\n\u062d\u062c\u0645: " + p.gb + " GB\n\u0631\u0648\u0632: " + p.days + "\n\u0642\u06cc\u0645\u062a: " + this.fmtToman(p.price) + "\n\u067e\u0648\u0631\u062a(\u0647\u0627): `" + (p.ports || "443") + "`\n\u06a9\u0627\u0631\u0628\u0631 \u0647\u0645\u0632\u0645\u0627\u0646: " + (p.ip_limit || 1) + "\n\u0648\u0636\u0639\u06cc\u062a: " + (p.is_active ? "\u0641\u0639\u0627\u0644" : "\u063a\u06cc\u0631\u0641\u0639\u0627\u0644") +
+			"\n\n\ud83d\udce6 \u0645\u0648\u062c\u0648\u062f\u06cc \u0622\u0645\u0627\u062f\u0647 \u0641\u0631\u0648\u0634 (\u067e\u06cc\u0634\u200c\u0633\u0627\u062e\u062a\u0647): " + (stockRow ? stockRow.c : 0) + "\n\u2705 \u0641\u0631\u0648\u062e\u062a\u0647 \u0634\u062f\u0647 \u0627\u0632 \u0627\u06cc\u0646 \u067e\u0644\u0646: " + (soldRow ? soldRow.c : 0);
+		await this.call(env, "sendMessage", {
+			chat_id: chatId,
+			text,
+			parse_mode: "Markdown",
+			reply_markup: {
+				inline_keyboard: [
+					[{ text: "\u23ef\ufe0f \u0641\u0639\u0627\u0644/\u063a\u06cc\u0631\u0641\u0639\u0627\u0644", callback_data: "admin_plan_toggle:" + p.id }],
+					[{ text: "\ud83d\udce6 \u0627\u0641\u0632\u0648\u062f\u0646 \u0628\u0647 \u0645\u0648\u062c\u0648\u062f\u06cc", callback_data: "admin_plan_addstock:" + p.id }],
+					[{ text: "\ud83d\uddd1 \u062d\u0630\u0641 \u067e\u0644\u0646", callback_data: "admin_plan_delete:" + p.id }],
+					[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_plans" }],
+				],
+			},
+		});
+	},
+	async addPlanStock(env, request, chatId, planId, count) {
+		const plan = await env.DB.prepare("SELECT * FROM plans WHERE id = ?").bind(planId).first();
+		if (!plan) return 0;
+		let created = 0;
+		for (let i = 0; i < count; i++) {
+			const uname = this.genStockUsername(planId);
+			const res = await this.createBotUser(env, request, null, null, {
+				username: uname,
+				limitGb: plan.gb,
+				expiryDays: plan.days,
+				port: plan.ports,
+				ipLimit: plan.ip_limit,
+				planId: plan.id,
+				isStock: true,
+			});
+			if (res.success) created++;
+		}
+		return created;
+	},
+	// ===== Admin: payment requests =====
+	async sendPaymentRequestsList(env, chatId) {
+		const { results } = await env.DB.prepare("SELECT * FROM payment_requests WHERE status = 'pending' ORDER BY id DESC LIMIT 20").all();
+		if (!results || results.length === 0) {
+			await this.call(env, "sendMessage", { chat_id: chatId, text: "\u062f\u0631\u062e\u0648\u0627\u0633\u062a \u062f\u0631 \u0627\u0646\u062a\u0638\u0627\u0631\u06cc \u0648\u062c\u0648\u062f \u0646\u062f\u0627\u0631\u062f.", reply_markup: { inline_keyboard: [[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_menu" }]] } });
+			return;
+		}
+		for (const r of results) {
+			const caption = "\ud83e\uddfe \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0634\u0627\u0631\u0698 \u06a9\u06cc\u0641 \u067e\u0648\u0644\n\ud83d\udc64 \u06a9\u0627\u0631\u0628\u0631: " + r.tg_user_id + "\n\ud83d\udcb0 \u0645\u0628\u0644\u063a: " + this.fmtToman(r.amount);
+			const kb = { inline_keyboard: [[{ text: "\u2705 \u062a\u0627\u06cc\u06cc\u062f", callback_data: "pay_approve:" + r.id }, { text: "\u274c \u0631\u062f", callback_data: "pay_reject:" + r.id }]] };
+			if (r.receipt_file_id) {
+				await this.call(env, "sendPhoto", { chat_id: chatId, photo: r.receipt_file_id, caption, reply_markup: kb });
+			} else {
+				await this.call(env, "sendMessage", { chat_id: chatId, text: caption, reply_markup: kb });
+			}
+		}
+	},
 	welcomeText() {
-		return "\ud83d\udd12 \u0628\u0647 \u0631\u0628\u0627\u062a *\u0644\u0648\u06a9\u06cc* \u062e\u0648\u0634 \u0627\u0648\u0645\u062f\u06cc!\n\n\u0627\u0632 \u0627\u06cc\u0646\u200c\u062c\u0627 \u0645\u06cc\u200c\u062a\u0648\u0646\u06cc \u0628\u0631\u0627\u06cc \u062e\u0648\u062f\u062a \u06cc\u0647 \u06a9\u0627\u0646\u0641\u06cc\u06af VLESS \u0631\u0627\u06cc\u06af\u0627\u0646 \u0628\u0633\u0627\u0632\u06cc (\u062a\u0627 \u06f1\u06f0 \u06af\u06cc\u06af \u0648 \u06f3\u06f0 \u0631\u0648\u0632 \u0627\u0639\u062a\u0628\u0627\u0631)\u060c \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0646\u0641\u06cc\u06af\u0647\u0627\u062a \u0631\u0648 \u0628\u0628\u06cc\u0646\u06cc\u060c \u0648 \u0644\u06cc\u0646\u06a9 \u0627\u0634\u062a\u0631\u0627\u06a9\u062a\u0648 \u0628\u06af\u06cc\u0631\u06cc.\n\n\u06cc\u06a9\u06cc \u0627\u0632 \u06af\u0632\u06cc\u0646\u0647\u200c\u0647\u0627\u06cc \u0632\u06cc\u0631 \u0631\u0648 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646 \ud83d\udc47";
+		return "\ud83d\udd12 \u0628\u0647 \u0631\u0628\u0627\u062a *\u0644\u0648\u06a9\u06cc* \u062e\u0648\u0634 \u0627\u0648\u0645\u062f\u06cc!\n\n\u0627\u0632 \u0627\u06cc\u0646\u200c\u062c\u0627 \u0645\u06cc\u200c\u062a\u0648\u0646\u06cc \u06cc\u06a9 \u06a9\u0627\u0646\u0641\u06cc\u06af VLESS \u0628\u062e\u0631\u06cc\u060c \u0648\u0636\u0639\u06cc\u062a \u06a9\u0627\u0646\u0641\u06cc\u06af\u0647\u0627\u062a \u0631\u0648 \u0628\u0628\u06cc\u0646\u06cc\u060c \u06a9\u06cc\u0641 \u067e\u0648\u0644\u062a \u0631\u0648 \u0634\u0627\u0631\u0698 \u06a9\u0646\u06cc \u0648 \u0644\u06cc\u0646\u06a9 \u0627\u0634\u062a\u0631\u0627\u06a9\u062a\u0648 \u0628\u06af\u06cc\u0631\u06cc.\n\n\u06cc\u06a9\u06cc \u0627\u0632 \u06af\u0632\u06cc\u0646\u0647\u200c\u0647\u0627\u06cc \u0632\u06cc\u0631 \u0631\u0648 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646 \ud83d\udc47";
 	},
 	async sendMainMenu(env, chatId, userId, extraText = null) {
 		await this.call(env, "sendMessage", {
@@ -321,6 +552,9 @@ const TelegramBot = {
 	},
 	genUsername(userId) {
 		return "tg" + String(userId).replace(/[^0-9]/g, "").slice(-8) + "_" + Math.random().toString(36).slice(2, 6);
+	},
+	genStockUsername(planId) {
+		return "stk" + planId + "_" + Date.now().toString(36).slice(-5) + Math.random().toString(36).slice(2, 5);
 	},
 	async createBotUser(env, request, chatId, userId, opts = {}) {
 		const username = opts.username || this.genUsername(userId);
@@ -338,11 +572,19 @@ const TelegramBot = {
 		} catch (e) {}
 		const limitGb = opts.limitGb != null ? opts.limitGb : 10;
 		const expiryDays = opts.expiryDays != null ? opts.expiryDays : 30;
+		const port = opts.port ? String(opts.port) : defaultPort;
+		const ipLimit = opts.ipLimit != null ? parseInt(opts.ipLimit, 10) : null;
+		const isStock = opts.isStock ? 1 : 0;
+		const planId = opts.planId != null ? opts.planId : null;
+		const proxyIata = opts.proxyIata ? String(opts.proxyIata).toUpperCase() : null;
+		const soldAt = isStock ? null : nowTime;
+		const tgChatId = isStock ? null : String(chatId);
+		const tgUserId = isStock ? null : String(userId);
 		try {
 			await env.DB.prepare(
-				"INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, used_gb, used_req, created_at, is_active, block_porn, block_ads, tg_chat_id, tg_user_id, frag_len, frag_int) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 1, 0, 0, ?, ?, '200-3000', '1-2')"
+				"INSERT INTO users (username, uuid, limit_gb, expiry_days, ips, connection_type, tls, port, fingerprint, used_gb, used_req, created_at, is_active, block_porn, block_ads, tg_chat_id, tg_user_id, frag_len, frag_int, ip_limit, max_connections, is_stock, plan_id, sold_at, user_proxy_iata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 1, 0, 0, ?, ?, '200-3000', '1-2', ?, ?, ?, ?, ?, ?)"
 			)
-				.bind(username, uuid, limitGb, expiryDays, host, "vl" + "e" + "ss", "tls", defaultPort, "chrome", nowTime, String(chatId), String(userId))
+				.bind(username, uuid, limitGb, expiryDays, host, "vl" + "e" + "ss", "tls", port, "chrome", nowTime, tgChatId, tgUserId, ipLimit, ipLimit, isStock, planId, soldAt, proxyIata)
 				.run();
 			return { success: true, username, subUrl: "https://" + host + "/sub/" + encodeURIComponent(username) };
 		} catch (e) {
@@ -374,6 +616,14 @@ const TelegramBot = {
 				[{ text: "\ud83d\udccb \u0644\u06cc\u0633\u062a \u06a9\u0627\u0631\u0628\u0631\u0627\u0646", callback_data: "admin_list:0" }],
 				[{ text: "\u2795 \u0627\u0641\u0632\u0648\u062f\u0646 \u06a9\u0627\u0631\u0628\u0631 \u062c\u062f\u06cc\u062f", callback_data: "admin_add" }],
 				[{ text: "\ud83d\udd0d \u062c\u0633\u062a\u062c\u0648\u06cc \u06a9\u0627\u0631\u0628\u0631", callback_data: "admin_search" }],
+				[{ text: "\ud83d\udcb3 \u067e\u0644\u0646\u200c\u0647\u0627\u06cc \u0641\u0631\u0648\u0634", callback_data: "admin_plans" }],
+				[{ text: "\ud83e\uddfe \u062f\u0631\u062e\u0648\u0627\u0633\u062a\u200c\u0647\u0627\u06cc \u067e\u0631\u062f\u0627\u062e\u062a", callback_data: "admin_payments" }],
+				[{ text: "\ud83d\udc5b \u0645\u062f\u06cc\u0631\u06cc\u062a \u06a9\u06cc\u0641 \u067e\u0648\u0644", callback_data: "admin_wallet_search" }],
+				[{ text: "\ud83d\udcb3 \u062a\u0646\u0638\u06cc\u0645\u0627\u062a \u06a9\u0627\u0631\u062a", callback_data: "admin_card_settings" }],
+				[{ text: "\ud83d\udcca \u0622\u0645\u0627\u0631 \u0641\u0631\u0648\u0634", callback_data: "admin_stats" }],
+				[{ text: "\ud83d\udce6 \u0645\u0648\u062c\u0648\u062f\u06cc \u067e\u06cc\u0634\u200c\u0633\u0627\u062e\u062a\u0647 (\u0641\u0631\u0648\u0634\u06cc)", callback_data: "admin_stock_list:0" }],
+				[{ text: "\ud83d\udce2 \u067e\u06cc\u0627\u0645 \u0647\u0645\u06af\u0627\u0646\u06cc", callback_data: "admin_broadcast" }],
+				[{ text: "\u2699\ufe0f \u062a\u0646\u0638\u06cc\u0645\u0627\u062a \u067e\u0631\u0648\u06a9\u0633\u06cc \u0633\u0631\u0627\u0633\u0631\u06cc", callback_data: "admin_proxy_settings" }],
 				[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a \u0628\u0647 \u0645\u0646\u0648", callback_data: "back_menu" }],
 			],
 		};
@@ -381,11 +631,32 @@ const TelegramBot = {
 	async sendAdminMenu(env, chatId) {
 		await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udee0 *\u067e\u0646\u0644 \u0645\u062f\u06cc\u0631\u06cc\u062a*\n\n\u06cc\u06a9\u06cc \u0627\u0632 \u06af\u0632\u06cc\u0646\u0647\u200c\u0647\u0627 \u0631\u0648 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646:", parse_mode: "Markdown", reply_markup: this.adminMenuKeyboard() });
 	},
+	async sendProxySettings(env, chatId) {
+		const rowIp = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
+		const rowIata = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_location_iata'").first();
+		const text =
+			"\u2699\ufe0f *\u062a\u0646\u0638\u06cc\u0645\u0627\u062a \u067e\u0631\u0648\u06a9\u0633\u06cc \u0633\u0631\u0627\u0633\u0631\u06cc*\n\n" +
+			"IP/\u067e\u0631\u0648\u06a9\u0633\u06cc \u0641\u0639\u0644\u06cc: `" + (rowIp && rowIp.value ? rowIp.value : "\u062a\u0646\u0638\u06cc\u0645 \u0646\u0634\u062f\u0647") + "`\n" +
+			"\u06a9\u0634\u0648\u0631 (IATA): `" + (rowIata && rowIata.value ? rowIata.value : "-") + "`";
+		await this.call(env, "sendMessage", {
+			chat_id: chatId,
+			text,
+			parse_mode: "Markdown",
+			reply_markup: {
+				inline_keyboard: [
+					[{ text: "\u270f\ufe0f \u062a\u063a\u06cc\u06cc\u0631 \u067e\u0631\u0648\u06a9\u0633\u06cc", callback_data: "admin_set_proxy" }],
+					[{ text: "\ud83e\uddea \u062a\u0633\u062a \u067e\u0631\u0648\u06a9\u0633\u06cc", callback_data: "admin_test_proxy" }],
+					[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_menu" }],
+				],
+			},
+		});
+	},
 	async sendUserList(env, chatId, page) {
 		const PAGE_SIZE = 8;
 		const offset = page * PAGE_SIZE;
-		const { results } = await env.DB.prepare("SELECT username, is_active, limit_gb, used_gb FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?").bind(PAGE_SIZE, offset).all();
-		const countRow = await env.DB.prepare("SELECT COUNT(*) as c FROM users").first();
+		const WHERE = "WHERE is_stock = 0 OR sold_at IS NOT NULL";
+		const { results } = await env.DB.prepare("SELECT username, is_active, limit_gb, used_gb FROM users " + WHERE + " ORDER BY created_at DESC LIMIT ? OFFSET ?").bind(PAGE_SIZE, offset).all();
+		const countRow = await env.DB.prepare("SELECT COUNT(*) as c FROM users " + WHERE).first();
 		const total = countRow ? countRow.c : 0;
 		if (!results || results.length === 0) {
 			await this.call(env, "sendMessage", { chat_id: chatId, text: page === 0 ? "\u0647\u06cc\u0686 \u06a9\u0627\u0631\u0628\u0631\u06cc \u062a\u0648 \u062f\u06cc\u062a\u0627\u0628\u06cc\u0633 \u0646\u06cc\u0633\u062a." : "\u0635\u0641\u062d\u0647\u200c\u06cc \u0628\u0639\u062f\u06cc \u0648\u062c\u0648\u062f \u0646\u062f\u0627\u0631\u062f." });
@@ -415,8 +686,20 @@ const TelegramBot = {
 					{ text: "\ud83d\udcc5 \u062a\u063a\u06cc\u06cc\u0631 \u0631\u0648\u0632", callback_data: "admin_edit_days:" + username },
 				],
 				[
+					{ text: "\ud83d\udd0c \u062a\u063a\u06cc\u06cc\u0631 \u067e\u0648\u0631\u062a", callback_data: "admin_edit_port:" + username },
+					{ text: "\ud83d\udc65 \u062a\u063a\u06cc\u06cc\u0631 \u06a9\u0627\u0631\u0628\u0631 \u0647\u0645\u0632\u0645\u0627\u0646", callback_data: "admin_edit_iplimit:" + username },
+				],
+				[
 					{ text: "\ud83d\udd04 \u0631\u06cc\u0633\u062a \u0645\u0635\u0631\u0641", callback_data: "admin_reset:" + username },
 					{ text: "\u23ef\ufe0f \u0641\u0639\u0627\u0644/\u063a\u06cc\u0631\u0641\u0639\u0627\u0644", callback_data: "admin_toggle:" + username },
+				],
+				[
+					{ text: "\ud83d\udeab \u0628\u0644\u0627\u06a9 \u067e\u0648\u0631\u0646/\u062a\u0628\u0644\u06cc\u063a\u0627\u062a", callback_data: "admin_block_menu:" + username },
+					{ text: "\ud83e\udde6 \u067e\u0631\u0648\u06a9\u0633\u06cc \u0627\u062e\u062a\u0635\u0627\u0635\u06cc", callback_data: "admin_edit_socks:" + username },
+				],
+				[
+					{ text: "\ud83d\udd01 \u0686\u0631\u062e\u0634 \u062e\u0648\u062f\u06a9\u0627\u0631 IP", callback_data: "admin_rotate_menu:" + username },
+					{ text: "\u267b\ufe0f \u0631\u06cc\u0633\u062a \u062e\u0648\u062f\u06a9\u0627\u0631", callback_data: "admin_edit_autoreset:" + username },
 				],
 				[
 					{ text: "\ud83d\udd17 \u0644\u06cc\u0646\u06a9 \u0627\u0634\u062a\u0631\u0627\u06a9", callback_data: "admin_getlink:" + username },
@@ -425,6 +708,63 @@ const TelegramBot = {
 				[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a \u0628\u0647 \u0644\u06cc\u0633\u062a", callback_data: "admin_list:0" }],
 			],
 		};
+	},
+	async sendBlockMenu(env, chatId, username) {
+		const u = await env.DB.prepare("SELECT block_porn, block_ads FROM users WHERE username = ?").bind(username).first();
+		await this.call(env, "sendMessage", {
+			chat_id: chatId,
+			text: "\ud83d\udeab \u0628\u0644\u0627\u06a9 \u0645\u062d\u062a\u0648\u0627 \u0628\u0631\u0627\u06cc *" + username + "*",
+			parse_mode: "Markdown",
+			reply_markup: {
+				inline_keyboard: [
+					[{ text: (u && u.block_porn === 1 ? "\u2705" : "\u2b1c\ufe0f") + " \u0628\u0644\u0627\u06a9 \u067e\u0648\u0631\u0646", callback_data: "admin_toggle_porn:" + username }],
+					[{ text: (u && u.block_ads === 1 ? "\u2705" : "\u2b1c\ufe0f") + " \u0628\u0644\u0627\u06a9 \u062a\u0628\u0644\u06cc\u063a\u0627\u062a", callback_data: "admin_toggle_ads:" + username }],
+					[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_user:" + username }],
+				],
+			},
+		});
+	},
+	async sendRotateMenu(env, chatId, username) {
+		const u = await env.DB.prepare("SELECT auto_rotate_ip, rotate_time, ip_count, ip_operator FROM users WHERE username = ?").bind(username).first();
+		await this.call(env, "sendMessage", {
+			chat_id: chatId,
+			text: "\ud83d\udd01 \u0686\u0631\u062e\u0634 \u062e\u0648\u062f\u06a9\u0627\u0631 IP \u0628\u0631\u0627\u06cc *" + username + "*\n\u0648\u0636\u0639\u06cc\u062a: " + (u && u.auto_rotate_ip === 1 ? "\u0641\u0639\u0627\u0644" : "\u063a\u06cc\u0631\u0641\u0639\u0627\u0644") + "\n\u0641\u0627\u0635\u0644\u0647: " + (u ? u.rotate_time : 0) + " \u062f\u0642\u06cc\u0642\u0647 \u2014 \u062a\u0639\u062f\u0627\u062f IP: " + (u ? u.ip_count : 20),
+			parse_mode: "Markdown",
+			reply_markup: {
+				inline_keyboard: [
+					[{ text: (u && u.auto_rotate_ip === 1 ? "\u2705 \u0641\u0639\u0627\u0644 (\u062e\u0627\u0645\u0648\u0634 \u0634\u062f\u0646)" : "\u2b1c\ufe0f \u0641\u0639\u0627\u0644\u200c\u0633\u0627\u0632\u06cc"), callback_data: "admin_toggle_rotate:" + username }],
+					[{ text: "\u270f\ufe0f \u062a\u0646\u0638\u06cc\u0645 \u0641\u0627\u0635\u0644\u0647 \u0648 \u062a\u0639\u062f\u0627\u062f", callback_data: "admin_edit_rotate:" + username }],
+					[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_user:" + username }],
+				],
+			},
+		});
+	},
+	async sendStockList(env, chatId, page) {
+		const PAGE_SIZE = 8;
+		const offset = page * PAGE_SIZE;
+		const { results } = await env.DB
+			.prepare(
+				"SELECT u.username, u.limit_gb, u.expiry_days, p.name as plan_name FROM users u LEFT JOIN plans p ON p.id = u.plan_id WHERE u.is_stock = 1 AND u.sold_at IS NULL ORDER BY u.created_at DESC LIMIT ? OFFSET ?"
+			)
+			.bind(PAGE_SIZE, offset)
+			.all();
+		const countRow = await env.DB.prepare("SELECT COUNT(*) as c FROM users WHERE is_stock = 1 AND sold_at IS NULL").first();
+		const total = countRow ? countRow.c : 0;
+		if (!results || results.length === 0) {
+			await this.call(env, "sendMessage", {
+				chat_id: chatId,
+				text: page === 0 ? "\ud83d\udce6 \u0645\u0648\u062c\u0648\u062f\u06cc \u067e\u06cc\u0634\u200c\u0633\u0627\u062e\u062a\u0647\u200c\u0627\u06cc \u0648\u062c\u0648\u062f \u0646\u062f\u0627\u0631\u062f. \u0627\u0632 \u0628\u062e\u0634 \u067e\u0644\u0646\u200c\u0647\u0627 \u2192 \u0627\u0641\u0632\u0648\u062f\u0646 \u0628\u0647 \u0645\u0648\u062c\u0648\u062f\u06cc \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u06a9\u0646." : "\u0635\u0641\u062d\u0647\u200c\u06cc \u0628\u0639\u062f\u06cc \u0648\u062c\u0648\u062f \u0646\u062f\u0627\u0631\u062f.",
+				reply_markup: { inline_keyboard: [[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_menu" }]] },
+			});
+			return;
+		}
+		const rows = results.map((u) => [{ text: "\ud83d\udce6 " + u.username + " \u2014 " + (u.plan_name || "-") + " (" + u.limit_gb + "GB/" + u.expiry_days + "d)", callback_data: "admin_user:" + u.username }]);
+		const nav = [];
+		if (page > 0) nav.push({ text: "\u25c0\ufe0f \u0642\u0628\u0644\u06cc", callback_data: "admin_stock_list:" + (page - 1) });
+		if (offset + results.length < total) nav.push({ text: "\u0628\u0639\u062f\u06cc \u25b6\ufe0f", callback_data: "admin_stock_list:" + (page + 1) });
+		if (nav.length) rows.push(nav);
+		rows.push([{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_menu" }]);
+		await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udce6 *\u0645\u0648\u062c\u0648\u062f\u06cc \u067e\u06cc\u0634\u200c\u0633\u0627\u062e\u062a\u0647 (\u0641\u0631\u0648\u0634\u06cc \u2014 \u0641\u0631\u0648\u062e\u062a\u0647 \u0646\u0634\u062f\u0647)* \u2014 " + total + " \u06a9\u0627\u0646\u0641\u06cc\u06af", parse_mode: "Markdown", reply_markup: { inline_keyboard: rows } });
 	},
 	async sendUserDetail(env, chatId, username) {
 		const u = await env.DB.prepare("SELECT * FROM users WHERE username = ?").bind(username).first();
@@ -442,6 +782,10 @@ const TelegramBot = {
 			"\u062d\u062c\u0645: " + Number(u.used_gb || 0).toFixed(2) + " / " + u.limit_gb + " GB\n" +
 			"\u0631\u0648\u0632 \u0628\u0627\u0642\u06cc\u0645\u0627\u0646\u062f\u0647: " + daysLeft + "\n" +
 			"\u067e\u0648\u0631\u062a: `" + u.port + "` \u2014 TLS: `" + u.tls + "`\n" +
+			"\u06a9\u0627\u0631\u0628\u0631 \u0647\u0645\u0632\u0645\u0627\u0646: " + (u.ip_limit || "\u0646\u0627\u0645\u062d\u062f\u0648\u062f") + "\n" +
+			"\u0628\u0644\u0627\u06a9 \u067e\u0648\u0631\u0646/\u062a\u0628\u0644\u06cc\u063a\u0627\u062a: " + (u.block_porn === 1 ? "\u067e\u0648\u0631\u0646 " : "") + (u.block_ads === 1 ? "\u062a\u0628\u0644\u06cc\u063a\u0627\u062a" : "") + (u.block_porn !== 1 && u.block_ads !== 1 ? "\u063a\u06cc\u0631\u0641\u0639\u0627\u0644" : "") + "\n" +
+			"\u0686\u0631\u062e\u0634 \u062e\u0648\u062f\u06a9\u0627\u0631 IP: " + (u.auto_rotate_ip === 1 ? "\u0641\u0639\u0627\u0644 (\u0647\u0631 " + u.rotate_time + " \u062f\u0642\u06cc\u0642\u0647)" : "\u063a\u06cc\u0631\u0641\u0639\u0627\u0644") + "\n" +
+			"\u067e\u0631\u0648\u06a9\u0633\u06cc \u0627\u062e\u062a\u0635\u0627\u0635\u06cc: " + (u.user_socks5 ? "\u062a\u0646\u0638\u06cc\u0645 \u0634\u062f\u0647" : "\u0646\u062f\u0627\u0631\u062f") + "\n" +
 			"UUID: `" + u.uuid + "`";
 		await this.call(env, "sendMessage", { chat_id: chatId, text, parse_mode: "Markdown", reply_markup: await this.userDetailKeyboard(username) });
 	},
@@ -484,18 +828,7 @@ const TelegramBot = {
 				}
 
 				if (data === "new_config") {
-					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u0633\u0627\u062e\u062a \u06a9\u0627\u0646\u0641\u06cc\u06af..." });
-					const result = await this.createBotUser(env, request, chatId, userId);
-					if (result.success) {
-						await this.call(env, "sendMessage", {
-							chat_id: chatId,
-							text: "\u2705 \u06a9\u0627\u0646\u0641\u06cc\u06af\u062a \u0633\u0627\u062e\u062a\u0647 \u0634\u062f!\n\n\ud83d\udc64 \u0646\u0627\u0645: `" + result.username + "`\n\ud83d\udce6 \u062d\u062c\u0645: 10 GB\n\ud83d\udcc5 \u0627\u0639\u062a\u0628\u0627\u0631: 30 \u0631\u0648\u0632\n\n\ud83d\udd17 \u0644\u06cc\u0646\u06a9 \u0627\u0634\u062a\u0631\u0627\u06a9:\n`" + result.subUrl + "`",
-							parse_mode: "Markdown",
-						});
-					} else {
-						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u274c \u062e\u0637\u0627 \u062f\u0631 \u0633\u0627\u062e\u062a \u06a9\u0627\u0646\u0641\u06cc\u06af." });
-					}
-					await this.sendMainMenu(env, chatId, userId);
+					await this.sendPlansList(env, chatId);
 				} else if (data === "my_configs") {
 					const text = await this.myConfigsText(env, chatId, request);
 					await this.call(env, "sendMessage", { chat_id: chatId, text, parse_mode: "Markdown" });
@@ -528,6 +861,65 @@ const TelegramBot = {
 					const username = data.slice("admin_edit_days:".length);
 					await this.setSession(env, chatId, "await_edit_days", { username });
 					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u062a\u0639\u062f\u0627\u062f \u0631\u0648\u0632 \u062c\u062f\u06cc\u062f \u0631\u0648 \u0628\u0641\u0631\u0633\u062a (\u0645\u062b\u0644\u0627 30):" });
+				} else if (data.startsWith("admin_edit_port:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_edit_port:".length);
+					await this.setSession(env, chatId, "await_edit_port", { username });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udd0c \u067e\u0648\u0631\u062a(\u0647\u0627\u06cc) \u062c\u062f\u06cc\u062f \u0631\u0648 \u0628\u0641\u0631\u0633\u062a (\u0628\u0631\u0627\u06cc \u0686\u0646\u062f \u067e\u0648\u0631\u062a \u0628\u0627 \u06a9\u0627\u0645\u0627 \u062c\u062f\u0627 \u06a9\u0646\u060c \u0645\u062b\u0644\u0627: 443,2096,8080):" });
+				} else if (data.startsWith("admin_edit_iplimit:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_edit_iplimit:".length);
+					await this.setSession(env, chatId, "await_edit_iplimit", { username });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udc65 \u062a\u0639\u062f\u0627\u062f \u062c\u062f\u06cc\u062f \u06a9\u0627\u0631\u0628\u0631 \u0647\u0645\u0632\u0645\u0627\u0646 (\u062f\u0633\u062a\u06af\u0627\u0647) \u0631\u0648 \u0628\u0641\u0631\u0633\u062a (\u0645\u062b\u0644\u0627 2):" });
+				} else if (data.startsWith("admin_block_menu:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_block_menu:".length);
+					await this.sendBlockMenu(env, chatId, username);
+				} else if (data.startsWith("admin_toggle_porn:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_toggle_porn:".length);
+					await env.DB.prepare("UPDATE users SET block_porn = CASE WHEN block_porn = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
+					await this.sendBlockMenu(env, chatId, username);
+				} else if (data.startsWith("admin_toggle_ads:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_toggle_ads:".length);
+					await env.DB.prepare("UPDATE users SET block_ads = CASE WHEN block_ads = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
+					await this.sendBlockMenu(env, chatId, username);
+				} else if (data.startsWith("admin_edit_socks:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_edit_socks:".length);
+					await this.setSession(env, chatId, "await_edit_socks", { username });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83e\udde6 \u0622\u062f\u0631\u0633 \u067e\u0631\u0648\u06a9\u0633\u06cc SOCKS5 \u0627\u062e\u062a\u0635\u0627\u0635\u06cc \u0627\u06cc\u0646 \u06a9\u0627\u0631\u0628\u0631 \u0631\u0648 \u0628\u0641\u0631\u0633\u062a (\u0645\u062b\u0627\u0644: user:pass@ip:port) \u06cc\u0627 \u0628\u0631\u0627\u06cc \u062d\u0630\u0641 \u0628\u0646\u0648\u06cc\u0633 -:" });
+				} else if (data.startsWith("admin_rotate_menu:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_rotate_menu:".length);
+					await this.sendRotateMenu(env, chatId, username);
+				} else if (data.startsWith("admin_toggle_rotate:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_toggle_rotate:".length);
+					await env.DB.prepare("UPDATE users SET auto_rotate_ip = CASE WHEN auto_rotate_ip = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
+					await this.sendRotateMenu(env, chatId, username);
+				} else if (data.startsWith("admin_edit_rotate:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_edit_rotate:".length);
+					await this.setSession(env, chatId, "await_edit_rotate", { username });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0641\u0627\u0635\u0644\u0647 \u0628\u0647 \u062f\u0642\u06cc\u0642\u0647 \u0648 \u062a\u0639\u062f\u0627\u062f IP \u0631\u0648 \u0628\u0627 \u06a9\u0627\u0645\u0627 \u0628\u0641\u0631\u0633\u062a (\u0645\u062b\u0627\u0644: 60,20):" });
+				} else if (data.startsWith("admin_edit_autoreset:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const username = data.slice("admin_edit_autoreset:".length);
+					await this.setSession(env, chatId, "await_edit_autoreset", { username });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0631\u0648\u0632 \u0631\u06cc\u0633\u062a \u062e\u0648\u062f\u06a9\u0627\u0631 \u062d\u062c\u0645 \u0648 \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0631\u0648 \u0628\u0627 \u06a9\u0627\u0645\u0627 \u0628\u0641\u0631\u0633\u062a (\u0645\u062b\u0627\u0644: 30,0 \u06cc\u0639\u0646\u06cc \u0647\u0631 30 \u0631\u0648\u0632 \u062d\u062c\u0645 \u0631\u06cc\u0633\u062a \u0634\u0648\u062f \u0648 \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u063a\u06cc\u0631\u0641\u0639\u0627\u0644):" });
+				} else if (data === "admin_proxy_settings") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.sendProxySettings(env, chatId);
+				} else if (data === "admin_set_proxy") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.setSession(env, chatId, "await_set_proxy", {});
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0622\u062f\u0631\u0633 \u067e\u0631\u0648\u06a9\u0633\u06cc \u0633\u0631\u0627\u0633\u0631\u06cc \u062c\u062f\u06cc\u062f \u0631\u0648 \u0628\u0641\u0631\u0633\u062a (\u0645\u062b\u0627\u0644: 1.2.3.4:443 \u06cc\u0627 socks5://user:pass@ip:port):" });
+				} else if (data === "admin_test_proxy") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.setSession(env, chatId, "await_test_proxy", {});
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0622\u062f\u0631\u0633 \u067e\u0631\u0648\u06a9\u0633\u06cc\u06cc \u06a9\u0647 \u0645\u06cc\u062e\u0648\u0627\u06cc \u062a\u0633\u062a \u06a9\u0646\u06cc \u0631\u0648 \u0628\u0641\u0631\u0633\u062a:" });
 				} else if (data.startsWith("admin_reset:")) {
 					if (!this.isAdmin(env, userId)) return new Response("ok");
 					const username = data.slice("admin_reset:".length);
@@ -567,6 +959,154 @@ const TelegramBot = {
 					if (!this.isAdmin(env, userId)) return new Response("ok");
 					await this.setSession(env, chatId, "await_search", {});
 					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0628\u062e\u0634\u06cc \u0627\u0632 \u06cc\u0648\u0632\u0631\u0646\u06cc\u0645 \u0631\u0648 \u0628\u0641\u0631\u0633\u062a:" });
+
+				// ===== Buy flow =====
+				} else if (data === "buy_menu") {
+					await this.sendPlansList(env, chatId);
+				} else if (data.startsWith("buy_plan:")) {
+					const planId = parseInt(data.slice("buy_plan:".length), 10);
+					await this.sendCountrySelect(env, chatId, planId);
+				} else if (data.startsWith("buy_country:")) {
+					const code = data.slice("buy_country:".length);
+					const session0 = await this.getSession(env, chatId);
+					const planId = session0.data && session0.data.planId;
+					await this.clearSession(env, chatId);
+					if (!planId) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u062c\u0644\u0633\u0647 \u0645\u0646\u0642\u0636\u06cc \u0634\u062f\u0647\u060c \u062f\u0648\u0628\u0627\u0631\u0647 \u0627\u0632 \u0645\u0646\u0648 \u062e\u0631\u06cc\u062f \u0634\u0631\u0648\u0639 \u06a9\u0646." });
+					} else {
+						await this.buyPlan(env, request, chatId, userId, planId, code === "NONE" ? null : code);
+					}
+					await this.sendMainMenu(env, chatId, userId);
+
+				// ===== Wallet =====
+				} else if (data === "wallet_menu") {
+					await this.sendWalletMenu(env, chatId, userId);
+				} else if (data === "wallet_topup") {
+					await this.startWalletTopup(env, chatId);
+
+				// ===== Admin: plans =====
+				} else if (data === "admin_plans") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.sendPlansAdminList(env, chatId);
+				} else if (data === "admin_plan_add") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.setSession(env, chatId, "await_plan_name", {});
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udcdd \u0646\u0627\u0645 \u067e\u0644\u0646 \u0631\u0648 \u0628\u0641\u0631\u0633\u062a (\u0645\u062b\u0644\u0627: \u067e\u0644\u0646 \u0637\u0644\u0627\u06cc\u06cc):" });
+				} else if (data.startsWith("admin_plan_toggle:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const id = parseInt(data.slice("admin_plan_toggle:".length), 10);
+					await env.DB.prepare("UPDATE plans SET is_active = 1 - is_active WHERE id = ?").bind(id).run();
+					await this.sendPlanDetail(env, chatId, id);
+				} else if (data.startsWith("admin_plan_addstock:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const id = parseInt(data.slice("admin_plan_addstock:".length), 10);
+					await this.setSession(env, chatId, "await_plan_stock_count", { planId: id });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udd22 \u0686\u0646\u062f \u062a\u0627 \u06a9\u0627\u0646\u0641\u06cc\u06af \u067e\u06cc\u0634\u200c\u0633\u0627\u062e\u062a\u0647 \u0628\u0631\u0627\u06cc \u0627\u06cc\u0646 \u067e\u0644\u0646 \u0627\u0636\u0627\u0641\u0647 \u0634\u0648\u062f\u061f (\u0645\u062b\u0644\u0627 5):" });
+				} else if (data.startsWith("admin_plan_delete:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const id = parseInt(data.slice("admin_plan_delete:".length), 10);
+					await env.DB.prepare("DELETE FROM plans WHERE id = ?").bind(id).run();
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\uddd1 \u067e\u0644\u0646 \u062d\u0630\u0641 \u0634\u062f." });
+					await this.sendPlansAdminList(env, chatId);
+				} else if (data.startsWith("admin_plan:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const id = parseInt(data.slice("admin_plan:".length), 10);
+					await this.sendPlanDetail(env, chatId, id);
+
+				// ===== Admin: payment requests =====
+				} else if (data === "admin_payments") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.sendPaymentRequestsList(env, chatId);
+				} else if (data.startsWith("pay_approve:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const id = parseInt(data.slice("pay_approve:".length), 10);
+					const pr = await env.DB.prepare("SELECT * FROM payment_requests WHERE id = ?").bind(id).first();
+					if (pr && pr.status === "pending") {
+						await env.DB.prepare("UPDATE payment_requests SET status = 'approved', reviewed_at = ? WHERE id = ?").bind(Date.now(), id).run();
+						await this.adjustWallet(env, pr.tg_user_id, pr.tg_chat_id, Number(pr.amount), "topup", "\u0634\u0627\u0631\u0698 \u06a9\u0627\u0631\u062a \u0628\u0647 \u06a9\u0627\u0631\u062a \u062a\u0627\u06cc\u06cc\u062f \u0634\u062f\u0647");
+						await this.call(env, "sendMessage", { chat_id: pr.tg_chat_id, text: "\u2705 \u0634\u0627\u0631\u0698 " + this.fmtToman(pr.amount) + " \u0628\u0647 \u06a9\u06cc\u0641 \u067e\u0648\u0644\u062a \u0627\u0636\u0627\u0641\u0647 \u0634\u062f." });
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u062a\u0627\u06cc\u06cc\u062f \u0634\u062f \u0648 \u06a9\u06cc\u0641 \u067e\u0648\u0644 \u06a9\u0627\u0631\u0628\u0631 \u0634\u0627\u0631\u0698 \u0634\u062f." });
+					} else {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0627\u06cc\u0646 \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0642\u0628\u0644\u0627\u064b \u0628\u0631\u0631\u0633\u06cc \u0634\u062f\u0647." });
+					}
+				} else if (data.startsWith("pay_reject:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const id = parseInt(data.slice("pay_reject:".length), 10);
+					const pr = await env.DB.prepare("SELECT * FROM payment_requests WHERE id = ?").bind(id).first();
+					if (pr && pr.status === "pending") {
+						await env.DB.prepare("UPDATE payment_requests SET status = 'rejected', reviewed_at = ? WHERE id = ?").bind(Date.now(), id).run();
+						await this.call(env, "sendMessage", { chat_id: pr.tg_chat_id, text: "\u274c \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0634\u0627\u0631\u0698 \u06a9\u06cc\u0641 \u067e\u0648\u0644 \u0634\u0645\u0627 \u0631\u062f \u0634\u062f. \u062f\u0631 \u0635\u0648\u0631\u062a \u0627\u0634\u062a\u0628\u0627\u0647 \u0628\u0627 \u067e\u0634\u062a\u06cc\u0628\u0627\u0646\u06cc \u062a\u0645\u0627\u0633 \u0628\u06af\u06cc\u0631." });
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u274c \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0631\u062f \u0634\u062f." });
+					} else {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0627\u06cc\u0646 \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0642\u0628\u0644\u0627\u064b \u0628\u0631\u0631\u0633\u06cc \u0634\u062f\u0647." });
+					}
+
+				// ===== Admin: wallet management =====
+				} else if (data === "admin_wallet_search") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.setSession(env, chatId, "await_wallet_search", {});
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83c\udd94 \u0622\u06cc\u062f\u06cc \u062a\u0644\u06af\u0631\u0627\u0645 (tg_user_id) \u06a9\u0627\u0631\u0628\u0631 \u0631\u0648 \u0628\u0641\u0631\u0633\u062a:" });
+				} else if (data.startsWith("wallet_credit:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const tuid = data.slice("wallet_credit:".length);
+					await this.setSession(env, chatId, "await_wallet_credit", { tuid });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0645\u0628\u0644\u063a \u0627\u0641\u0632\u0627\u06cc\u0634 (\u0645\u062b\u0628\u062a) \u0631\u0648 \u0628\u0647 \u062a\u0648\u0645\u0627\u0646 \u0628\u0641\u0631\u0633\u062a:" });
+				} else if (data.startsWith("wallet_debit:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const tuid = data.slice("wallet_debit:".length);
+					await this.setSession(env, chatId, "await_wallet_debit", { tuid });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0645\u0628\u0644\u063a \u06a9\u0627\u0647\u0634 (\u0645\u062b\u0628\u062a) \u0631\u0648 \u0628\u0647 \u062a\u0648\u0645\u0627\u0646 \u0628\u0641\u0631\u0633\u062a:" });
+
+				// ===== Admin: card settings =====
+				} else if (data === "admin_card_settings") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const card = await this.getCardInfo(env);
+					await this.call(env, "sendMessage", {
+						chat_id: chatId,
+						text: "\ud83d\udcb3 \u0634\u0645\u0627\u0631\u0647 \u06a9\u0627\u0631\u062a \u0641\u0639\u0644\u06cc: `" + (card.number || "\u062b\u0628\u062a \u0646\u0634\u062f\u0647") + "`\n\ud83d\udc64 \u0628\u0647 \u0646\u0627\u0645: " + (card.holder || "\u062b\u0628\u062a \u0646\u0634\u062f\u0647"),
+						parse_mode: "Markdown",
+						reply_markup: { inline_keyboard: [
+							[{ text: "\u270f\ufe0f \u062a\u063a\u06cc\u06cc\u0631 \u0634\u0645\u0627\u0631\u0647 \u06a9\u0627\u0631\u062a", callback_data: "admin_set_card_number" }],
+							[{ text: "\u270f\ufe0f \u062a\u063a\u06cc\u06cc\u0631 \u0646\u0627\u0645 \u0635\u0627\u062d\u0628 \u06a9\u0627\u0631\u062a", callback_data: "admin_set_card_holder" }],
+							[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_menu" }],
+						] },
+					});
+				} else if (data === "admin_set_card_number") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.setSession(env, chatId, "await_card_number", {});
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0634\u0645\u0627\u0631\u0647 \u06a9\u0627\u0631\u062a \u062c\u062f\u06cc\u062f \u0631\u0648 \u0628\u0641\u0631\u0633\u062a:" });
+				} else if (data === "admin_set_card_holder") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.setSession(env, chatId, "await_card_holder", {});
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0646\u0627\u0645 \u0635\u0627\u062d\u0628 \u06a9\u0627\u0631\u062a \u062c\u062f\u06cc\u062f \u0631\u0648 \u0628\u0641\u0631\u0633\u062a:" });
+
+				// ===== Admin: sales stats =====
+				} else if (data === "admin_stats") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const totalRow = await env.DB.prepare("SELECT COUNT(*) as c, COALESCE(SUM(price),0) as s FROM sales_log").first();
+					const todayStart = Math.floor(Date.now() / 86400000) * 86400000;
+					const todayRow = await env.DB.prepare("SELECT COUNT(*) as c, COALESCE(SUM(price),0) as s FROM sales_log WHERE created_at >= ?").bind(todayStart).first();
+					const walletRow = await env.DB.prepare("SELECT COALESCE(SUM(balance),0) as s FROM wallets").first();
+					const activeConfigsRow = await env.DB.prepare("SELECT COUNT(*) as c FROM users WHERE (is_stock = 0 OR sold_at IS NOT NULL) AND is_active = 1").first();
+					const stockRow = await env.DB.prepare("SELECT COUNT(*) as c FROM users WHERE is_stock = 1 AND sold_at IS NULL").first();
+					const text =
+						"\ud83d\udcca *\u0622\u0645\u0627\u0631 \u0641\u0631\u0648\u0634*\n\n" +
+						"\ud83d\udecd\ufe0f \u06a9\u0644 \u0641\u0631\u0648\u0634\u200c\u0647\u0627: " + (totalRow ? totalRow.c : 0) + "\n" +
+						"\ud83d\udcb0 \u06a9\u0644 \u062f\u0631\u0622\u0645\u062f: " + this.fmtToman(totalRow ? totalRow.s : 0) + "\n\n" +
+						"\ud83d\udcc5 \u0641\u0631\u0648\u0634 \u0627\u0645\u0631\u0648\u0632: " + (todayRow ? todayRow.c : 0) + "\n" +
+						"\ud83d\udcb5 \u062f\u0631\u0622\u0645\u062f \u0627\u0645\u0631\u0648\u0632: " + this.fmtToman(todayRow ? todayRow.s : 0) + "\n\n" +
+						"\ud83d\udc65 \u06a9\u0627\u0646\u0641\u06cc\u06af\u200c\u0647\u0627\u06cc \u0641\u0639\u0627\u0644 (\u062f\u0631 \u062d\u0627\u0644 \u0627\u0633\u062a\u0641\u0627\u062f\u0647): " + (activeConfigsRow ? activeConfigsRow.c : 0) + "\n" +
+						"\ud83d\udce6 \u0645\u0648\u062c\u0648\u062f\u06cc \u067e\u06cc\u0634\u200c\u0633\u0627\u062e\u062a\u0647 \u0628\u0627\u0642\u06cc\u0645\u0627\u0646\u062f\u0647: " + (stockRow ? stockRow.c : 0) + "\n\n" +
+						"\ud83d\udc5b \u0645\u062c\u0645\u0648\u0639 \u0645\u0648\u062c\u0648\u062f\u06cc \u06a9\u06cc\u0641 \u067e\u0648\u0644\u200c\u0647\u0627: " + this.fmtToman(walletRow ? walletRow.s : 0);
+					await this.call(env, "sendMessage", { chat_id: chatId, text, parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_menu" }]] } });
+				} else if (data.startsWith("admin_stock_list:")) {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					const page = parseInt(data.slice("admin_stock_list:".length), 10) || 0;
+					await this.sendStockList(env, chatId, page);
+				} else if (data === "admin_broadcast") {
+					if (!this.isAdmin(env, userId)) return new Response("ok");
+					await this.setSession(env, chatId, "await_broadcast_text", {});
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udce2 \u0645\u062a\u0646 \u067e\u06cc\u0627\u0645 \u0647\u0645\u06af\u0627\u0646\u06cc \u0631\u0648 \u0628\u0641\u0631\u0633\u062a (\u0628\u0631\u0627\u06cc \u0647\u0645\u0647\u0654 \u06a9\u0627\u0631\u0628\u0631\u0627\u0646 \u0631\u0628\u0627\u062a \u0627\u0631\u0633\u0627\u0644 \u0645\u06cc\u0634\u0647):" });
 				}
 				return new Response("ok");
 			}
@@ -599,6 +1139,194 @@ const TelegramBot = {
 				}
 
 				const session = await this.getSession(env, chatId);
+
+				if (session.state === "await_topup_receipt") {
+					if (!msg.photo || msg.photo.length === 0) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0644\u0637\u0641\u0627\u064b \u0639\u06a9\u0633 \u0631\u0633\u06cc\u062f \u067e\u0631\u062f\u0627\u062e\u062a \u0631\u0648 \u0628\u0641\u0631\u0633\u062a (\u0628\u0647 \u0635\u0648\u0631\u062a \u0639\u06a9\u0633\u060c \u0646\u0647 \u0641\u0627\u06cc\u0644)." });
+						return new Response("ok");
+					}
+					const fileId = msg.photo[msg.photo.length - 1].file_id;
+					const amount = session.data.amount;
+					await this.clearSession(env, chatId);
+					const ins = await env.DB.prepare("INSERT INTO payment_requests (tg_user_id, tg_chat_id, amount, receipt_file_id, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)")
+						.bind(String(userId), String(chatId), amount, fileId, Date.now())
+						.run();
+					const requestId = ins.meta && ins.meta.last_row_id ? ins.meta.last_row_id : null;
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0634\u0627\u0631\u0698 \u062b\u0628\u062a \u0634\u062f. \u0628\u0639\u062f \u0627\u0632 \u062a\u0627\u06cc\u06cc\u062f \u0627\u062f\u0645\u06cc\u0646\u060c \u06a9\u06cc\u0641 \u067e\u0648\u0644\u062a \u0634\u0627\u0631\u0698 \u0645\u06cc\u0634\u0647. \u0644\u0637\u0641\u0627\u064b \u0645\u0646\u062a\u0638\u0631 \u0628\u0645\u0648\u0646." });
+					const adminIds = (env.TELEGRAM_ADMIN_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
+					const caption = "\ud83e\uddfe \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0634\u0627\u0631\u0698 \u06a9\u06cc\u0641 \u067e\u0648\u0644 \u062c\u062f\u06cc\u062f\n\ud83d\udc64 \u06a9\u0627\u0631\u0628\u0631: " + userId + "\n\ud83d\udcb0 \u0645\u0628\u0644\u063a: " + this.fmtToman(amount);
+					const kb = requestId ? { inline_keyboard: [[{ text: "\u2705 \u062a\u0627\u06cc\u06cc\u062f", callback_data: "pay_approve:" + requestId }, { text: "\u274c \u0631\u062f", callback_data: "pay_reject:" + requestId }]] } : undefined;
+					for (const aid of adminIds) {
+						await this.call(env, "sendPhoto", { chat_id: aid, photo: fileId, caption, reply_markup: kb });
+					}
+					return new Response("ok");
+				}
+
+				if (session.state === "await_topup_amount") {
+					const val = parseInt(text.replace(/[^0-9]/g, ""), 10);
+					if (isNaN(val) || val < 10000) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0645\u0628\u0644\u063a \u0646\u0627\u0645\u0639\u062a\u0628\u0631\u0647. \u062d\u062f\u0627\u0642\u0644 \u0645\u0628\u0644\u063a 10,000 \u062a\u0648\u0645\u0627\u0646 \u0631\u0627 \u0641\u0642\u0637 \u0628\u0647 \u0635\u0648\u0631\u062a \u0639\u062f\u062f \u0648\u0627\u0631\u062f \u06a9\u0646:" });
+						return new Response("ok");
+					}
+					const card = await this.getCardInfo(env);
+					if (!card.number) {
+						await this.clearSession(env, chatId);
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u26a0\ufe0f \u0647\u0646\u0648\u0632 \u0634\u0645\u0627\u0631\u0647 \u06a9\u0627\u0631\u062a \u062a\u0648\u0633\u0637 \u0627\u062f\u0645\u06cc\u0646 \u062b\u0628\u062a \u0646\u0634\u062f\u0647. \u0644\u0637\u0641\u0627\u064b \u0628\u0639\u062f\u0627\u064b \u062a\u0644\u0627\u0634 \u06a9\u0646." });
+						return new Response("ok");
+					}
+					await this.setSession(env, chatId, "await_topup_receipt", { amount: val });
+					await this.call(env, "sendMessage", {
+						chat_id: chatId,
+						text: "\ud83d\udcb3 \u0645\u0628\u0644\u063a " + this.fmtToman(val) + " \u0631\u0648 \u0628\u0647 \u0634\u0645\u0627\u0631\u0647 \u06a9\u0627\u0631\u062a \u0632\u06cc\u0631 \u0648\u0627\u0631\u06cc\u0632 \u06a9\u0646:\n\n`" + card.number + "`\n\u0628\u0647 \u0646\u0627\u0645 " + (card.holder || "-") + "\n\n\u0633\u067e\u0633 \u0639\u06a9\u0633 \u0631\u0633\u06cc\u062f \u0631\u0648 \u0647\u0645\u06cc\u0646\u062c\u0627 \u0628\u0641\u0631\u0633\u062a.",
+						parse_mode: "Markdown",
+					});
+					return new Response("ok");
+				}
+
+				if (session.state === "await_broadcast_text" && this.isAdmin(env, userId)) {
+				await this.clearSession(env, chatId);
+				const { results } = await env.DB.prepare(
+					"SELECT DISTINCT tg_chat_id as cid FROM users WHERE tg_chat_id IS NOT NULL UNION SELECT DISTINCT tg_chat_id as cid FROM wallets WHERE tg_chat_id IS NOT NULL"
+				).all();
+				let sent = 0;
+				for (const r of results || []) {
+					try {
+						await this.call(env, "sendMessage", { chat_id: r.cid, text });
+						sent++;
+					} catch (e) {}
+				}
+				await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u067e\u06cc\u0627\u0645 \u0628\u0631\u0627\u06cc " + sent + " \u06a9\u0627\u0631\u0628\u0631 \u0627\u0631\u0633\u0627\u0644 \u0634\u062f." });
+				return new Response("ok");
+			}
+
+			if (session.state === "await_wallet_search" && this.isAdmin(env, userId)) {
+					const tuid = text.replace(/[^0-9]/g, "");
+					await this.clearSession(env, chatId);
+					if (!tuid) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0622\u06cc\u062f\u06cc \u0646\u0627\u0645\u0639\u062a\u0628\u0631." });
+						return new Response("ok");
+					}
+					const wallet = await this.getWallet(env, tuid, tuid);
+					await this.call(env, "sendMessage", {
+						chat_id: chatId,
+						text: "\ud83c\udd94 " + tuid + "\n\ud83d\udcb0 \u0645\u0648\u062c\u0648\u062f\u06cc: " + this.fmtToman(wallet.balance),
+						reply_markup: { inline_keyboard: [
+							[{ text: "\u2795 \u0627\u0641\u0632\u0627\u06cc\u0634 \u0645\u0648\u062c\u0648\u062f\u06cc", callback_data: "wallet_credit:" + tuid }, { text: "\u2796 \u06a9\u0627\u0647\u0634 \u0645\u0648\u062c\u0648\u062f\u06cc", callback_data: "wallet_debit:" + tuid }],
+							[{ text: "\u2b05\ufe0f \u0628\u0627\u0632\u06af\u0634\u062a", callback_data: "admin_menu" }],
+						] },
+					});
+					return new Response("ok");
+				}
+				if (session.state === "await_wallet_credit" && this.isAdmin(env, userId)) {
+					const val = parseInt(text.replace(/[^0-9]/g, ""), 10);
+					if (isNaN(val) || val <= 0) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+						return new Response("ok");
+					}
+					const tuid = session.data.tuid;
+					await this.clearSession(env, chatId);
+					const newBal = await this.adjustWallet(env, tuid, tuid, val, "admin_credit", "\u0634\u0627\u0631\u0698 \u062f\u0633\u062a\u06cc \u062a\u0648\u0633\u0637 \u0627\u062f\u0645\u06cc\u0646");
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u0645\u0648\u062c\u0648\u062f\u06cc \u062c\u062f\u06cc\u062f: " + this.fmtToman(newBal) });
+					await this.call(env, "sendMessage", { chat_id: tuid, text: "\ud83d\udcb0 \u06a9\u06cc\u0641 \u067e\u0648\u0644 \u0634\u0645\u0627 \u062a\u0648\u0633\u0637 \u0627\u062f\u0645\u06cc\u0646 " + this.fmtToman(val) + " \u0634\u0627\u0631\u0698 \u0634\u062f." });
+					return new Response("ok");
+				}
+				if (session.state === "await_wallet_debit" && this.isAdmin(env, userId)) {
+					const val = parseInt(text.replace(/[^0-9]/g, ""), 10);
+					if (isNaN(val) || val <= 0) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+						return new Response("ok");
+					}
+					const tuid = session.data.tuid;
+					await this.clearSession(env, chatId);
+					const newBal = await this.adjustWallet(env, tuid, tuid, -val, "admin_debit", "\u06a9\u0633\u0631 \u062f\u0633\u062a\u06cc \u062a\u0648\u0633\u0637 \u0627\u062f\u0645\u06cc\u0646");
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u0645\u0648\u062c\u0648\u062f\u06cc \u062c\u062f\u06cc\u062f: " + this.fmtToman(newBal) });
+					return new Response("ok");
+				}
+				if (session.state === "await_card_number" && this.isAdmin(env, userId)) {
+					await this.setSetting(env, "card_number", text);
+					await this.clearSession(env, chatId);
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u0634\u0645\u0627\u0631\u0647 \u06a9\u0627\u0631\u062a \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f." });
+					return new Response("ok");
+				}
+				if (session.state === "await_card_holder" && this.isAdmin(env, userId)) {
+					await this.setSetting(env, "card_holder", text);
+					await this.clearSession(env, chatId);
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u0646\u0627\u0645 \u0635\u0627\u062d\u0628 \u06a9\u0627\u0631\u062a \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f." });
+					return new Response("ok");
+				}
+				if (session.state === "await_plan_name" && this.isAdmin(env, userId)) {
+					await this.setSession(env, chatId, "await_plan_gb", { name: text });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udce6 \u062d\u062c\u0645 \u067e\u0644\u0646 \u0631\u0648 \u0628\u0647 \u06af\u06cc\u06af\u0627\u0628\u0627\u06cc\u062a \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0645\u062b\u0644\u0627 10):" });
+					return new Response("ok");
+				}
+				if (session.state === "await_plan_gb" && this.isAdmin(env, userId)) {
+					const val = parseFloat(text);
+					if (isNaN(val) || val <= 0) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+						return new Response("ok");
+					}
+					await this.setSession(env, chatId, "await_plan_days", { name: session.data.name, gb: val });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udcc5 \u062a\u0639\u062f\u0627\u062f \u0631\u0648\u0632 \u0627\u0639\u062a\u0628\u0627\u0631 \u0631\u0648 \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0645\u062b\u0644\u0627 30):" });
+					return new Response("ok");
+				}
+				if (session.state === "await_plan_days" && this.isAdmin(env, userId)) {
+					const val = parseInt(text, 10);
+					if (isNaN(val) || val <= 0) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+						return new Response("ok");
+					}
+					await this.setSession(env, chatId, "await_plan_price", { name: session.data.name, gb: session.data.gb, days: val });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udcb0 \u0642\u06cc\u0645\u062a \u067e\u0644\u0646 \u0631\u0648 \u0628\u0647 \u062a\u0648\u0645\u0627\u0646 \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0645\u062b\u0644\u0627 150000):" });
+					return new Response("ok");
+				}
+				if (session.state === "await_plan_stock_count" && this.isAdmin(env, userId)) {
+					const val = parseInt(text, 10);
+					if (isNaN(val) || val <= 0 || val > 100) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a (\u062d\u062f\u0627\u06a9\u062b\u0631 100). \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+						return new Response("ok");
+					}
+					const planId = session.data.planId;
+					await this.clearSession(env, chatId);
+					const created = await this.addPlanStock(env, request, chatId, planId, val);
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 " + created + " \u06a9\u0627\u0646\u0641\u06cc\u06af \u067e\u06cc\u0634\u200c\u0633\u0627\u062e\u062a\u0647 \u0628\u0647 \u0645\u0648\u062c\u0648\u062f\u06cc \u0627\u06cc\u0646 \u067e\u0644\u0646 \u0627\u0636\u0627\u0641\u0647 \u0634\u062f. \u0648\u0642\u062a\u06cc \u06a9\u0633\u06cc \u0627\u06cc\u0646 \u067e\u0644\u0646 \u0631\u0648 \u0628\u062e\u0631\u0647\u060c \u06cc\u06a9\u06cc \u0627\u0632 \u0647\u0645\u06cc\u0646\u200c\u0647\u0627 \u0628\u0647\u0634 \u062a\u062e\u0635\u06cc\u0635 \u062f\u0627\u062f\u0647 \u0645\u06cc\u200c\u0634\u0647." });
+					await this.sendPlanDetail(env, chatId, planId);
+					return new Response("ok");
+				}
+				if (session.state === "await_plan_price" && this.isAdmin(env, userId)) {
+					const val = parseInt(text.replace(/[^0-9]/g, ""), 10);
+					if (isNaN(val) || val < 0) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+						return new Response("ok");
+					}
+					await this.setSession(env, chatId, "await_plan_ports", { name: session.data.name, gb: session.data.gb, days: session.data.days, price: val });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udd0c \u067e\u0648\u0631\u062a(\u0647\u0627) \u0631\u0648 \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0628\u0627 \u06a9\u0627\u0645\u0627 \u062c\u062f\u0627 \u06a9\u0646 \u0627\u06af\u0631 \u0686\u0646\u062f\u062a\u0627\u0633\u062a\u060c \u0645\u062b\u0644\u0627: 443,2096,8080) \u06cc\u0627 \u0641\u0642\u0637 \u06cc\u06a9 \u0639\u062f\u062f \u0628\u0641\u0631\u0633\u062a:" });
+					return new Response("ok");
+				}
+				if (session.state === "await_plan_ports" && this.isAdmin(env, userId)) {
+					const ports = text.replace(/[^0-9,]/g, "").replace(/,+/g, ",").replace(/^,|,$/g, "");
+					if (!ports) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u067e\u0648\u0631\u062a \u0646\u0627\u0645\u0639\u062a\u0628\u0631. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+						return new Response("ok");
+					}
+					await this.setSession(env, chatId, "await_plan_iplimit", { name: session.data.name, gb: session.data.gb, days: session.data.days, price: session.data.price, ports });
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udc65 \u062a\u0639\u062f\u0627\u062f \u06a9\u0627\u0631\u0628\u0631 \u0647\u0645\u0632\u0645\u0627\u0646 (ip_limit) \u0631\u0648 \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0645\u062b\u0644\u0627 1 \u06cc\u0627 2):" });
+					return new Response("ok");
+				}
+				if (session.state === "await_plan_iplimit" && this.isAdmin(env, userId)) {
+					const val = parseInt(text, 10);
+					if (isNaN(val) || val <= 0) {
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+						return new Response("ok");
+					}
+					await env.DB.prepare("INSERT INTO plans (name, gb, days, price, ports, ip_limit, is_active, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)")
+						.bind(session.data.name, session.data.gb, session.data.days, session.data.price, session.data.ports, val, session.data.price, Date.now())
+						.run();
+					await this.clearSession(env, chatId);
+					await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u067e\u0644\u0646 \u0627\u0636\u0627\u0641\u0647 \u0634\u062f." });
+					await this.sendPlansAdminList(env, chatId);
+					return new Response("ok");
+				}
+
 				if (session.state && this.isAdmin(env, userId)) {
 					if (session.state === "await_edit_limit") {
 						const val = parseFloat(text);
@@ -609,6 +1337,30 @@ const TelegramBot = {
 						await env.DB.prepare("UPDATE users SET limit_gb = ? WHERE username = ?").bind(val, session.data.username).run();
 						await this.clearSession(env, chatId);
 						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u062d\u062c\u0645 \u0628\u0647 \u0631\u0648\u0632 \u0634\u062f." });
+						await this.sendUserDetail(env, chatId, session.data.username);
+						return new Response("ok");
+					}
+					if (session.state === "await_edit_port") {
+						const ports = text.replace(/[^0-9,]/g, "").replace(/,+/g, ",").replace(/^,|,$/g, "");
+						if (!ports) {
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u067e\u0648\u0631\u062a \u0646\u0627\u0645\u0639\u062a\u0628\u0631. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+							return new Response("ok");
+						}
+						await env.DB.prepare("UPDATE users SET port = ? WHERE username = ?").bind(ports, session.data.username).run();
+						await this.clearSession(env, chatId);
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u067e\u0648\u0631\u062a(\u0647\u0627) \u0628\u0647\u200c\u0631\u0648\u0632 \u0634\u062f." });
+						await this.sendUserDetail(env, chatId, session.data.username);
+						return new Response("ok");
+					}
+					if (session.state === "await_edit_iplimit") {
+						const val = parseInt(text, 10);
+						if (isNaN(val) || val <= 0) {
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+							return new Response("ok");
+						}
+						await env.DB.prepare("UPDATE users SET ip_limit = ?, max_connections = ? WHERE username = ?").bind(val, val, session.data.username).run();
+						await this.clearSession(env, chatId);
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u062a\u0639\u062f\u0627\u062f \u06a9\u0627\u0631\u0628\u0631 \u0647\u0645\u0632\u0645\u0627\u0646 \u0628\u0647\u200c\u0631\u0648\u0632 \u0634\u062f." });
 						await this.sendUserDetail(env, chatId, session.data.username);
 						return new Response("ok");
 					}
@@ -625,6 +1377,73 @@ const TelegramBot = {
 						await this.sendUserDetail(env, chatId, session.data.username);
 						return new Response("ok");
 					}
+					if (session.state === "await_edit_socks") {
+						const val = text.trim();
+						const socksVal = val === "-" ? null : val;
+						await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE username = ?").bind(socksVal, session.data.username).run();
+						await this.clearSession(env, chatId);
+						await this.call(env, "sendMessage", { chat_id: chatId, text: socksVal ? "\u2705 \u067e\u0631\u0648\u06a9\u0633\u06cc \u0627\u062e\u062a\u0635\u0627\u0635\u06cc \u062b\u0628\u062a \u0634\u062f." : "\u2705 \u067e\u0631\u0648\u06a9\u0633\u06cc \u0627\u062e\u062a\u0635\u0627\u0635\u06cc \u062d\u0630\u0641 \u0634\u062f." });
+						await this.sendUserDetail(env, chatId, session.data.username);
+						return new Response("ok");
+					}
+					if (session.state === "await_edit_rotate") {
+						const parts = text.split(",").map((s) => parseInt(s.trim(), 10));
+						const minutes = parts[0];
+						const count = parts[1];
+						if (isNaN(minutes) || minutes <= 0 || isNaN(count) || count <= 0) {
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0641\u0631\u0645\u062a \u0646\u0627\u062f\u0631\u0633\u062a. \u0645\u062b\u0627\u0644: 60,20" });
+							return new Response("ok");
+						}
+						await env.DB.prepare("UPDATE users SET rotate_time = ?, ip_count = ? WHERE username = ?").bind(minutes, count, session.data.username).run();
+						await this.clearSession(env, chatId);
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u062a\u0646\u0638\u06cc\u0645\u0627\u062a \u0686\u0631\u062e\u0634 IP \u0628\u0647\u200c\u0631\u0648\u0632 \u0634\u062f." });
+						await this.sendRotateMenu(env, chatId, session.data.username);
+						return new Response("ok");
+					}
+					if (session.state === "await_edit_autoreset") {
+						const parts = text.split(",").map((s) => parseInt(s.trim(), 10));
+						const volDays = isNaN(parts[0]) ? 0 : parts[0];
+						const reqDays = isNaN(parts[1]) ? 0 : parts[1];
+						const nowTime = Date.now();
+						await env.DB.prepare("UPDATE users SET auto_reset_vol_days = ?, auto_reset_req_days = ?, last_reset_vol_time = ?, last_reset_req_time = ? WHERE username = ?")
+							.bind(volDays, reqDays, nowTime, nowTime, session.data.username)
+							.run();
+						await this.clearSession(env, chatId);
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u062a\u0646\u0638\u06cc\u0645\u0627\u062a \u0631\u06cc\u0633\u062a \u062e\u0648\u062f\u06a9\u0627\u0631 \u0628\u0647\u200c\u0631\u0648\u0632 \u0634\u062f." });
+						await this.sendUserDetail(env, chatId, session.data.username);
+						return new Response("ok");
+					}
+					if (session.state === "await_set_proxy") {
+						const val = text.trim();
+						await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(val).run();
+						await this.clearSession(env, chatId);
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u067e\u0631\u0648\u06a9\u0633\u06cc \u0633\u0631\u0627\u0633\u0631\u06cc \u062b\u0628\u062a \u0634\u062f." });
+						await this.sendProxySettings(env, chatId);
+						return new Response("ok");
+					}
+					if (session.state === "await_test_proxy") {
+						const proxy = text.trim();
+						await this.clearSession(env, chatId);
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\u23f3 \u062f\u0631 \u062d\u0627\u0644 \u062a\u0633\u062a..." });
+						try {
+							const startTime = Date.now();
+							const payload = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+							const s = await connectProxy(proxy, "1.1.1.1", 80, payload);
+							const reader = s.readable.getReader();
+							const res = await reader.read();
+							if (res.done || !res.value) {
+								s.close();
+								throw new Error("\u062a\u0627\u06cc\u0645\u200c\u0627\u0648\u062a \u062f\u0631 \u062f\u0631\u06cc\u0627\u0641\u062a \u062f\u06cc\u062a\u0627");
+							}
+							s.close();
+							const ping = Date.now() - startTime;
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u067e\u0631\u0648\u06a9\u0633\u06cc \u0633\u0627\u0644\u0645 \u0627\u0633\u062a! \u067e\u06cc\u0646\u06af: " + ping + "ms" });
+						} catch (e) {
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u274c \u062a\u0633\u062a \u0646\u0627\u0645\u0648\u0641\u0642: " + (e && e.message ? e.message : "\u062e\u0637\u0627\u06cc \u0646\u0627\u0645\u0634\u062e\u0635") });
+						}
+						await this.sendProxySettings(env, chatId);
+						return new Response("ok");
+					}
 					if (session.state === "await_add_username") {
 						const uname = text.replace(/[^a-zA-Z0-9_-]/g, "");
 						if (!uname) {
@@ -636,10 +1455,51 @@ const TelegramBot = {
 							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0627\u06cc\u0646 \u06cc\u0648\u0632\u0631\u0646\u06cc\u0645 \u0642\u0628\u0644\u0627\u064b \u06af\u0631\u0641\u062a\u0647 \u0634\u062f\u0647. \u06cc\u06a9\u06cc \u062f\u06cc\u06af\u0647 \u0628\u0641\u0631\u0633\u062a." });
 							return new Response("ok");
 						}
-						const result = await this.createBotUser(env, request, chatId, userId, { username: uname, limitGb: 50, expiryDays: 365 });
+						await this.setSession(env, chatId, "await_add_gb", { username: uname });
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udce6 \u062d\u062c\u0645 \u0631\u0648 \u0628\u0647 \u06af\u06cc\u06af\u0627\u0628\u0627\u06cc\u062a \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0645\u062b\u0644\u0627 50):" });
+						return new Response("ok");
+					}
+					if (session.state === "await_add_gb") {
+						const val = parseFloat(text);
+						if (isNaN(val) || val <= 0) {
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+							return new Response("ok");
+						}
+						await this.setSession(env, chatId, "await_add_days", { username: session.data.username, gb: val });
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udcc5 \u062a\u0639\u062f\u0627\u062f \u0631\u0648\u0632 \u0627\u0639\u062a\u0628\u0627\u0631 \u0631\u0648 \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0645\u062b\u0644\u0627 365):" });
+						return new Response("ok");
+					}
+					if (session.state === "await_add_days") {
+						const val = parseInt(text, 10);
+						if (isNaN(val) || val <= 0) {
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+							return new Response("ok");
+						}
+						await this.setSession(env, chatId, "await_add_ports", { username: session.data.username, gb: session.data.gb, days: val });
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udd0c \u067e\u0648\u0631\u062a(\u0647\u0627) \u0631\u0648 \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0628\u0627 \u06a9\u0627\u0645\u0627 \u062c\u062f\u0627 \u06a9\u0646\u060c \u0645\u062b\u0644\u0627: 443,2096,8080):" });
+						return new Response("ok");
+					}
+					if (session.state === "await_add_ports") {
+						const ports = text.replace(/[^0-9,]/g, "").replace(/,+/g, ",").replace(/^,|,$/g, "");
+						if (!ports) {
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u067e\u0648\u0631\u062a \u0646\u0627\u0645\u0639\u062a\u0628\u0631. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+							return new Response("ok");
+						}
+						await this.setSession(env, chatId, "await_add_iplimit", { username: session.data.username, gb: session.data.gb, days: session.data.days, ports });
+						await this.call(env, "sendMessage", { chat_id: chatId, text: "\ud83d\udc65 \u062a\u0639\u062f\u0627\u062f \u06a9\u0627\u0631\u0628\u0631 \u0647\u0645\u0632\u0645\u0627\u0646 (ip_limit) \u0631\u0648 \u0648\u0627\u0631\u062f \u06a9\u0646 (\u0645\u062b\u0644\u0627 1):" });
+						return new Response("ok");
+					}
+					if (session.state === "await_add_iplimit") {
+						const val = parseInt(text, 10);
+						if (isNaN(val) || val <= 0) {
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u0639\u062f\u062f \u0645\u0639\u062a\u0628\u0631 \u0646\u06cc\u0633\u062a. \u062f\u0648\u0628\u0627\u0631\u0647 \u0628\u0641\u0631\u0633\u062a." });
+							return new Response("ok");
+						}
+						const { username: uname, gb, days, ports } = session.data;
+						const result = await this.createBotUser(env, request, chatId, userId, { username: uname, limitGb: gb, expiryDays: days, port: ports, ipLimit: val });
 						await this.clearSession(env, chatId);
 						if (result.success) {
-							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u06a9\u0627\u0631\u0628\u0631 \u0633\u0627\u062e\u062a\u0647 \u0634\u062f (\u067e\u06cc\u0634\u0641\u0631\u0636: 50GB / 365 \u0631\u0648\u0632 \u2014 \u0642\u0627\u0628\u0644 \u062a\u063a\u06cc\u06cc\u0631 \u0627\u0632 \u0647\u0645\u06cc\u0646 \u0635\u0641\u062d\u0647)." });
+							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u2705 \u06a9\u0627\u0631\u0628\u0631 \u0633\u0627\u062e\u062a\u0647 \u0634\u062f." });
 							await this.sendUserDetail(env, chatId, uname);
 						} else {
 							await this.call(env, "sendMessage", { chat_id: chatId, text: "\u274c \u062e\u0637\u0627 \u062f\u0631 \u0633\u0627\u062e\u062a." });
@@ -1357,6 +2217,29 @@ const DbService = {
 				await db.prepare("CREATE TABLE IF NOT EXISTS tg_sessions (chat_id TEXT PRIMARY KEY, state TEXT, data TEXT, updated_at INTEGER)").run();
 			} catch (e) {}
 			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS plans (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, gb REAL, days INTEGER, price INTEGER, is_active INTEGER DEFAULT 1, sort_order INTEGER DEFAULT 0, created_at INTEGER)").run();
+			} catch (e) {}
+			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS wallets (tg_user_id TEXT PRIMARY KEY, tg_chat_id TEXT, balance INTEGER DEFAULT 0, updated_at INTEGER)").run();
+			} catch (e) {}
+			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS wallet_tx (id INTEGER PRIMARY KEY AUTOINCREMENT, tg_user_id TEXT, amount INTEGER, type TEXT, note TEXT, created_at INTEGER)").run();
+			} catch (e) {}
+			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS payment_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, tg_user_id TEXT, tg_chat_id TEXT, amount INTEGER, receipt_file_id TEXT, status TEXT DEFAULT 'pending', admin_note TEXT, created_at INTEGER, reviewed_at INTEGER)").run();
+			} catch (e) {}
+			try {
+				await db.prepare("CREATE TABLE IF NOT EXISTS sales_log (id INTEGER PRIMARY KEY AUTOINCREMENT, tg_user_id TEXT, plan_id INTEGER, plan_name TEXT, price INTEGER, username TEXT, created_at INTEGER)").run();
+			} catch (e) {}
+			try {
+				const { results } = await db.prepare("PRAGMA table_info(plans)").all();
+				const existingPlanCols = new Set((results || []).map((r) => r.name));
+				const planStmts = [];
+				if (!existingPlanCols.has("ports")) planStmts.push(db.prepare("ALTER TABLE plans ADD COLUMN ports TEXT DEFAULT '443'"));
+				if (!existingPlanCols.has("ip_limit")) planStmts.push(db.prepare("ALTER TABLE plans ADD COLUMN ip_limit INTEGER DEFAULT 1"));
+				if (planStmts.length > 0) await db.batch(planStmts);
+			} catch (e) {}
+			try {
 				const { results } = await db.prepare("PRAGMA table_info(users)").all();
 				const existingCols = new Set((results || []).map((r) => r.name));
 				const colsToAdd = [
@@ -1387,7 +2270,10 @@ const DbService = {
 					{ name: "ip_operator", def: "TEXT DEFAULT 'all'" },
 					{ name: "ip_count", def: "INTEGER DEFAULT 20" },
 					{ name: "last_rotate_time", def: "INTEGER DEFAULT 0" },
-					{ name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" }
+					{ name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" },
+					{ name: "is_stock", def: "INTEGER DEFAULT 0" },
+					{ name: "plan_id", def: "INTEGER DEFAULT NULL" },
+					{ name: "sold_at", def: "INTEGER DEFAULT NULL" }
 				];
 				const stmts = [];
 				for (const col of colsToAdd) {
