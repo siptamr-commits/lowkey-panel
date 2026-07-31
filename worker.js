@@ -41,7 +41,7 @@ async function checkAutoRotates(env) {
 	try {
 		const { results: usersToRotate } = await env.DB.prepare("SELECT * FROM users WHERE auto_rotate_ip = 1 AND ? >= (last_rotate_time + (rotate_time * 60000))").bind(now).all();
 		if (!usersToRotate || usersToRotate.length === 0) return;
-		const res = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt");
+		const res = await fetch("https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/ips.txt");
 		if (!res.ok) return;
 		const text = await res.text();
 		const blocks = text.split("----------");
@@ -114,7 +114,7 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		const isOldProxyVIP = oldProxy.includes("@");
 		if (cachedVipCountries.length === 0 || Date.now() - lastVipCountriesFetch > 3600000) {
 			try {
-				const ghRes = await fetch("https://api.github.com/repos/IR-NETLIFY/zeus/contents/proxy/proxy_vip", {
+				const ghRes = await fetch("https://api.github.com/repos/zeus-panel/ZEUS-PANEL/contents/proxy/proxy_vip", {
 					headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" }
 				});
 				if (ghRes.ok) {
@@ -130,16 +130,16 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 			[fallbackVIPs[i], fallbackVIPs[j]] = [fallbackVIPs[j], fallbackVIPs[i]];
 		}
 		if (upperCountry !== "ALL" && upperCountry !== "UN") {
-			sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/${upperCountry}.txt`, type: 'repo' });
+			sources.push({ url: `https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/proxy/proxy_vip/${upperCountry}.txt`, type: 'repo' });
 		}
 		for (const fc of fallbackVIPs) {
 			if (fc !== upperCountry) {
-				sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/${fc}.txt`, type: 'repo' });
+				sources.push({ url: `https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/proxy/proxy_vip/${fc}.txt`, type: 'repo' });
 			}
 		}
 		if (!isOldProxyVIP) {
 			if (upperCountry !== "ALL" && upperCountry !== "UN") {
-				sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/${upperCountry}.txt`, type: 'repo' });
+				sources.push({ url: `https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/proxy/${upperCountry}.txt`, type: 'repo' });
 				sources.push({ url: `https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks5&country=${countryCode}&format=text`, type: 'socks5' });
 			}
 			sources.push({ url: `https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks5&country=all&format=text`, type: 'socks5' });
@@ -960,7 +960,7 @@ const Router = {
 					currentAccountId = accData.result[0].id;
 				}
 				
-				const githubRes = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/lowkey.js?t=" + Date.now(), {
+				const githubRes = await fetch("https://raw.githubusercontent.com/siptamr-commits/lowkey-panel/main/worker.js?t=" + Date.now(), {
 					headers: {
 						"User-Agent": "Mozilla/5.0",
 						"Cache-Control": "no-cache"
@@ -5433,7 +5433,7 @@ const CURRENT_VERSION = '1.9.0';
 let cachedIpsData = {};
 async function fetchIpsList() {
     try {
-        const response = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt');
+        const response = await fetch('https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/ips.txt');
         if (!response.ok) throw new Error('Fetch failed');
         const text = await response.text();
         const blocks = text.split('----------');
@@ -5579,7 +5579,7 @@ function toggleProxySelectorModal(show) { setModalState('proxy-selector-modal', 
 			const btn = document.getElementById('vip-fetch-btn');
 			select.innerHTML = '<option value="">در حال بررسی مخزن...</option>';
 			try {
-				const res = await fetch('https://api.github.com/repos/IR-NETLIFY/zeus/contents/proxy/proxy_vip');
+				const res = await fetch('https://api.github.com/repos/zeus-panel/ZEUS-PANEL/contents/proxy/proxy_vip');
 				if (!res.ok) throw new Error('API Error');
 				const data = await res.json();
 				const validCountries = data
@@ -5608,7 +5608,7 @@ function toggleProxySelectorModal(show) { setModalState('proxy-selector-modal', 
 			btn.disabled = true;
 			btn.innerText = '...';
 			try {
-				const url = 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/' + country + '.txt?t=' + Date.now();
+				const url = 'https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/proxy/proxy_vip/' + country + '.txt?t=' + Date.now();
 				const res = await fetch(url);
 				if (!res.ok) throw new Error('فایل یافت نشد');
 				const text = await res.text();
@@ -5689,7 +5689,7 @@ async function fetchAndLoadProxy() {
     try {
 		const sources = [
 			{ url: 'https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/countries/' + country.toUpperCase() + '/data.txt', prefix: '' },
-			{ url: 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/' + country.toUpperCase() + '.txt', prefix: '' },
+			{ url: 'https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/proxy/' + country.toUpperCase() + '.txt', prefix: '' },
 			{ url: 'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&country=' + country, prefix: 'socks5://' },
 			{ url: 'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&country=' + country, prefix: 'socks4://' },
 			{ url: 'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&country=' + country, prefix: 'http://' },

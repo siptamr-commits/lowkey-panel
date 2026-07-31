@@ -6,17 +6,12 @@ compatibility_flags = ["nodejs_compat"]
 # ===== D1 Database =====
 [[d1_databases]]
 binding = "DB"
-database_name = "lowkey-db"
-database_id = "YOUR_D1_DATABASE_ID"
+database_name = "shayan878"
+database_id = "18ca347d-e0c6-4b6d-b339-8c7c74e880d6"
 
 # ===== Environment Variables =====
-# These should be set via `wrangler secret put` or in the Cloudflare dashboard
+# Set these via `wrangler secret put` or Cloudflare dashboard
 # ADMIN_PASSWORD = "change-me"
 # TELEGRAM_BOT_TOKEN = "your-bot-token"
 # TELEGRAM_ADMIN_IDS = "your-telegram-id"
 # TELEGRAM_CHANNEL = "@YourChannel"
-
-# ===== Routes (optional) =====
-# routes = [
-#   { pattern = "panel.yourdomain.com/*", zone_name = "yourdomain.com" }
-# ]
